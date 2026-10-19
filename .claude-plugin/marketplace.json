@@ -1,0 +1,13 @@
+{
+  "name": "agent-todos",
+  "description": "Claude Code mod: one todo board for all agents in a project, your blockers on top",
+  "owner": {
+    "name": "XyndoX"
+  },
+  "plugins": [
+    {
+      "name": "agent-todos",
+      "source": "./"
+    }
+  ]
+}

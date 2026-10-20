@@ -1,6 +1,6 @@
 {
   "name": "agent-todos",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "One board for the todos of every agent working in this project, with the items only you can do pinned on top. Search + priority.",
   "author": { "name": "Chris Reinhardt" },
   "license": "MIT",

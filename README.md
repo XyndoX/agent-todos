@@ -31,6 +31,7 @@ Inspired by OmniFocus 4: perspectives, todos grouped by agent like projects, a c
 | ◉ red / ○ orange·blue / ◌ gray | P0 / P1·P2 / P3 |
 | ⚑ | P0 or P1 |
 | ⇢n | finishing it unblocks n other tasks |
+| ☐ / ✎ | found by **⟳ Scan repo**: an open checkbox / a code comment |
 | ✝ | its session has ended |
 
 ## Install
@@ -50,6 +51,13 @@ Answer `y` to add the marketplace, then pick a scope. User scope puts it in ever
   - **▶ Kick off** asks the agent that owns the todo to start on it now. A todo of this session starts a turn here. A todo of another session is sent to that session as a message.
   - **✓ Done** ticks it off.
   - **P0–P3** changes its priority (stored per todo on your machine).
+- **⟳ Scan repo** (or `/todos scan`) collects todos from the project into a "Found in repo" group:
+  - open `- [ ]` checkboxes in Markdown. ROADMAP / NEXT-TASKS / TODO / BACKLOG files keep their priority, and checkboxes in other docs (plans, notes) drop to P3.
+  - `TODO` / `FIXME` / `HACK` / `XXX` at the start of a comment. FIXME counts as P1.
+  - A line that starts with your name (`Chris:`, `Chris-only:`, taken from `git config user.name` and your home folder) is marked as yours (◆).
+  - Crossed-out `~~…~~` lines are skipped. A new scan replaces the last one, and at most 300 items are kept (roadmap first, then code, then other docs).
+  - It uses `git grep`, which respects `.gitignore`. Outside a git repo it falls back to `grep -r`, skipping `node_modules`, `dist` and `build`.
+  - **▶ Kick off** on a found item hands it to the current session together with its `file:line`.
 - The tabs at the top (You, Urgent, Active, Blocked, All) switch between perspectives.
 
 ## How items get on the board

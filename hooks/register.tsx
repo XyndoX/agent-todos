@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { Item, Row, SessionFile } from '../types'
-import { VIEWS, inView, isHumanOwner, matches, parseTitle, rank, rowKey } from './board'
+import { VIEWS, inView, isHumanOwner, matches, parseScan, parseTitle, rank, rowKey } from './board'
 
 const PANE = 'agent-todos'
 const rowsAtom = atom({ plugin: 'agent-todos', key: 'rows' } as const, [] as Row[])
@@ -83,11 +83,34 @@ async function setPrio($: $, row: Row, priority: number) {
   await refresh($)
 }
 
+const SCAN_RE = '(TODO|FIXME|HACK|XXX)|^[[:space:]]*([-*+]|[0-9]+\\.)[[:space:]]+\\[ \\]'
+
+/** Find TODO/FIXME/HACK/XXX comments and open `- [ ]` checkboxes in the project; they replace the last scan. */
+async function scanRepo($: $) {
+  const root = await $.session.root()
+  await $.ui.toast('⟳ Scanning repo for todos…')
+  try {
+    const git = await $.process.run(['git', 'grep', '-n', '-I', '-E', SCAN_RE, '--', '.', ':!*.lock', ':!*.min.*', ':!*.map'], { cwd: root, timeoutMs: 60_000 })
+    const out = git.exitCode <= 1 && !git.stderr.includes('not a git repository')
+      ? git.stdout
+      : (await $.process.run(['grep', '-rnI', '-E', SCAN_RE, '--exclude-dir=node_modules', '--exclude-dir=.git', '--exclude-dir=dist', '--exclude-dir=build', '.'], { cwd: root, timeoutMs: 60_000 })).stdout
+    const name = (await $.process.run(['git', 'config', 'user.name'], { cwd: root }).catch(() => undefined))?.stdout.trim() ?? ''
+    const home = ((await $.env.get('HOME')) ?? '').split('/').pop() ?? ''
+    const found = parseScan(out, { me: [...name.split(/\s+/), home] })
+    await editMine($, items => [...items.filter(i => !i.id.startsWith('scan:')), ...found])
+    await update($, viewAtom, () => 'all')
+    await $.ui.toast(found.length ? `⟳ Found ${found.length} todo${found.length > 1 ? 's' : ''} in the repo` : '⟳ No TODOs or open checkboxes found')
+  } catch (err) {
+    await $.ui.toast(`Scan failed: ${String(err).slice(0, 120)}`)
+  }
+}
+
 /** Hand the task to the agent that owns it: a turn here, or a message to the other session. */
 async function kickOff($: $, row: Row) {
-  const text = `Start on this task now${row.priority <= 1 ? ' (high priority)' : ''}: "${row.title}"${row.note ? `\n\n${row.note}` : ''}`
+  const where = row.agent === 'repo' ? `\n\nFound at ${row.note} — remove the TODO / tick the checkbox when done.` : row.note ? `\n\n${row.note}` : ''
+  const text = `Start on this task now${row.priority <= 1 ? ' (high priority)' : ''}: "${row.title}"${where}`
   try {
-    if (row.sessionId === (await $.session.id())) await $.prompt.submit({ text })
+    if (row.agent === 'repo' || row.sessionId === (await $.session.id())) await $.prompt.submit({ text })
     else await $.session.send({ to: { sessionId: row.sessionId }, text })
     await $.ui.toast(`▶ Kicked off: ${row.title}`)
   } catch (err) {
@@ -99,7 +122,7 @@ const label = (e: { agentId?: string }) => e.agentId ?? 'main'
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'todos', description: 'Open the agent todo board (optional: a search query)' })
+    await $.command.register({ name: 'todos', description: 'Open the agent todo board (a search query, or "scan" to collect TODOs from the repo)' })
     await $.tool.register({
       name: 'human_todo',
       description:
@@ -126,8 +149,10 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'todos' }, async ($, e) => {
-    await $.state.set({ plugin: 'agent-todos', key: 'query' }, e.args.trim())
-    await refresh($)
+    const isScan = e.args.trim() === 'scan'
+    await $.state.set({ plugin: 'agent-todos', key: 'query' }, isScan ? '' : e.args.trim())
+    if (isScan) await scanRepo($)
+    else await refresh($)
     await $.ui.open({ id: PANE, title: 'Agent todos' })
     return { text: 'Agent todo board opened.' }
   })
@@ -227,7 +252,7 @@ export const register: Register = on => {
     // Agent groups, OmniFocus-project style; your items first as their own group.
     const groups = new Map<string, Row[]>()
     for (const r of rows) {
-      const g = r.isHuman ? 'you' : `${r.sessionId}|${r.agent}`
+      const g = r.isHuman ? 'you' : r.agent === 'repo' ? 'repo' : `${r.sessionId}|${r.agent}`
       groups.set(g, [...(groups.get(g) ?? []), r])
     }
 
@@ -262,6 +287,7 @@ export const register: Register = on => {
 
     const header = (g: string, list: Row[]) => {
       if (g === 'you') return <Text key="h:you" color={TABS.you.color} bold>{`◆ Waiting on you  ${list.length}`}</Text>
+      if (g === 'repo') return <Text key="h:repo"><Text color={REPO_COLOR} bold>▤ Found in repo</Text><Text dimColor>{`  TODO comments & open checkboxes · ${list.length}`}</Text></Text>
       const r = list[0]!
       const c = agentColor(`${r.sessionId}${r.agent}`)
       const where = r.sessionId === me ? 'this session' : `session ${r.sessionId.slice(0, 6)}`
@@ -282,15 +308,16 @@ export const register: Register = on => {
       return (
         <Box key="inspector" flexDirection="column" borderStyle="round" borderColor={bullet(r).color} paddingX={1} marginTop={1}>
           <Text bold color={bullet(r).color}>{`${bullet(r).glyph} ${r.title}`}</Text>
-          {r.note ? <Text dimColor wrap="wrap">{r.note}</Text> : null}
+          {r.note && r.agent !== 'repo' ? <Text dimColor wrap="wrap">{r.note}</Text> : null}
           {field('Status', r.isBlocked ? 'blocked' : r.status.replace('_', ' '), bullet(r).color)}
           {field('Priority', `P${r.priority} · ${pc.name}`, pc.color)}
-          {field('Owner', r.isHuman ? 'you' : r.agent, r.isHuman ? TABS.you.color : agentColor(`${r.sessionId}${r.agent}`))}
+          {r.agent === 'repo' && field('Found at', r.note ?? '', REPO_COLOR)}
+          {field('Owner', r.isHuman ? 'you' : r.agent === 'repo' ? 'repo · kick off assigns it here' : r.agent, r.isHuman ? TABS.you.color : agentColor(`${r.sessionId}${r.agent}`))}
           {field('Session', `${r.sessionId.slice(0, 8)}${r.sessionId === me ? ' (this one)' : ''}${r.isLive ? '' : ' · ended'}`)}
           {blockers.length > 0 && field('Waits on', blockers.join(', '), '#8e8e93')}
           {r.blocks > 0 && field('Unblocks', `${r.blocks} task${r.blocks > 1 ? 's' : ''}`, '#64d2ff')}
           <Box flexDirection="row" gap={1} marginTop={1}>
-            {!r.isHuman && r.isLive && <Button key="act:kick" hotkey="k" variant="primary" label="▶ Kick off" onPress={() => void kickOff($, r)} />}
+            {!r.isHuman && (r.isLive || r.agent === 'repo') && <Button key="act:kick" hotkey="k" variant="primary" label="▶ Kick off" onPress={() => void kickOff($, r)} />}
             <Button key="act:done" hotkey="d" label="✓ Done" onPress={() => void tickDone($, r)} />
             <Button key="act:close" hotkey="x" role="dismiss" label="Close" onPress={() => void update($, selAtom, () => '')} />
           </Box>
@@ -320,7 +347,12 @@ export const register: Register = on => {
       <Box flexDirection="column">
         <Box flexDirection="row" justifyContent="space-between">
           <Text bold color={TABS.you.color}>☑ Agent Todos</Text>
-          <Text dimColor>{`${project} · ${all.length} open`}</Text>
+          <Box flexDirection="row" gap={1}>
+            <Text dimColor>{`${project} · ${all.length} open`}</Text>
+            <Button key="scan" plain onPress={() => void scanRepo($)}>
+              <Text color="#1c1c1e" backgroundColor={REPO_COLOR}>{' ⟳ Scan repo '}</Text>
+            </Button>
+          </Box>
         </Box>
         <Box flexDirection="row" flexWrap="wrap">{VIEWS.map(tab)}</Box>
         {Input && (
@@ -359,8 +391,11 @@ function bullet(r: Row) {
   if (r.status === 'in_progress') return { glyph: '◐', color: TABS.active.color }
   if (r.isBlocked) return { glyph: '⊘', color: TABS.blocked.color }
   const p = PRIO[r.priority] ?? PRIO[2]!
+  if (r.agent === 'repo') return { glyph: r.id.startsWith('scan:md:') ? '☐' : '✎', color: p.color }
   return { glyph: r.priority === 0 ? '◉' : r.priority === 3 ? '◌' : '○', color: p.color }
 }
+
+const REPO_COLOR = '#ac8e68'
 
 const AGENT_COLORS = ['#64d2ff', '#ffd60a', '#ff375f', '#66d4cf', '#5e5ce6', '#ac8e68', '#30d158']
 function agentColor(s: string) {

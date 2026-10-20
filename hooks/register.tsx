@@ -2,12 +2,14 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { Item, Row, SessionFile } from '../types'
-import { isHumanOwner, matches, parseTitle, rank } from './board'
+import { VIEWS, inView, isHumanOwner, matches, parseTitle, rank, rowKey } from './board'
 
 const PANE = 'agent-todos'
 const rowsAtom = atom({ plugin: 'agent-todos', key: 'rows' } as const, [] as Row[])
 const queryAtom = atom({ plugin: 'agent-todos', key: 'query' } as const, '')
 const rootAtom = atom({ plugin: 'agent-todos', key: 'root' } as const, '')
+const viewAtom = atom({ plugin: 'agent-todos', key: 'view' } as const, 'all')
+const selAtom = atom({ plugin: 'agent-todos', key: 'selected' } as const, '')
 
 const GUIDE = `## Agent todo board
 The person sees one board of every agent's todos in this project. When something can only be done by the person (a login, a secret, a purchase, a decision, a physical action, an approval), call \`mcp__agent-todos__human_todo\` with a short imperative title and a priority (0 urgent … 3 someday) instead of only mentioning it in prose. Mark a task as the person's with TaskUpdate owner "user", or prefix its subject with "[you]". "P0".."P3" in a subject sets its priority.`
@@ -58,7 +60,8 @@ async function refresh($: $) {
     if (s?.items) files.push(s)
   }
   const done = new Set(((await $.store.get('done')) as string[] | undefined) ?? [])
-  const rows = rank(files, root, live, done)
+  const prio = ((await $.store.get('prio')) as Record<string, number> | undefined) ?? {}
+  const rows = rank(files, root, live, done, prio)
   await update($, rowsAtom, () => rows)
   await update($, rootAtom, () => root)
   const mine = rows.filter(r => r.isHuman).length
@@ -68,8 +71,28 @@ async function refresh($: $) {
 async function tickDone($: $, row: Row) {
   const done = ((await $.store.get('done')) as string[] | undefined) ?? []
   // ponytail: done-list grows forever; prune by age if it ever matters
-  await $.store.set('done', [...done, `${row.sessionId}:${row.id}`].slice(-2000))
+  await $.store.set('done', [...done, rowKey(row)].slice(-2000))
+  await update($, selAtom, () => '')
   await refresh($)
+  await $.ui.toast(`✓ ${row.title}`)
+}
+
+async function setPrio($: $, row: Row, priority: number) {
+  const prio = ((await $.store.get('prio')) as Record<string, number> | undefined) ?? {}
+  await $.store.set('prio', { ...prio, [rowKey(row)]: priority })
+  await refresh($)
+}
+
+/** Hand the task to the agent that owns it: a turn here, or a message to the other session. */
+async function kickOff($: $, row: Row) {
+  const text = `Start on this task now${row.priority <= 1 ? ' (high priority)' : ''}: "${row.title}"${row.note ? `\n\n${row.note}` : ''}`
+  try {
+    if (row.sessionId === (await $.session.id())) await $.prompt.submit({ text })
+    else await $.session.send({ to: { sessionId: row.sessionId }, text })
+    await $.ui.toast(`▶ Kicked off: ${row.title}`)
+  } catch (err) {
+    await $.ui.toast(`Could not reach that agent: ${String(err).slice(0, 120)}`)
+  }
 }
 
 const label = (e: { agentId?: string }) => e.agentId ?? 'main'
@@ -184,63 +207,166 @@ export const register: Register = on => {
     return r
   }).catch(($, e, next) => next(e))
 
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const ui = $.ui.resolve(e)
     const { Box, Text, Button } = ui
     const Input = 'Input' in ui ? ui.Input : undefined // mobile has no Input
     const all = await read($, rowsAtom)
     const query = await read($, queryAtom)
+    const view = await read($, viewAtom)
+    const selected = await read($, selAtom)
     const root = await read($, rootAtom)
-    const rows = all.filter(r => matches(r, query))
-    const yours = all.filter(r => r.isHuman).length
-    const room = Math.max(1, (e.viewport?.rows ?? 24) - 6)
+    const me = await $.session.id()
+    const width = Math.max(30, (e.props as { bodyColumns?: number }).bodyColumns ?? e.viewport?.columns ?? 80)
+    const rows = all.filter(r => inView(r, view) && matches(r, query))
+    const sel = all.find(r => rowKey(r) === selected)
     const project = root.split('/').filter(Boolean).pop() ?? root
+    let room = Math.max(3, (e.viewport?.rows ?? 30) - 8 - (sel ? 11 : 0))
 
-    const line = (r: Row) => {
-      const mark = r.isHuman ? '★' : r.status === 'in_progress' ? '▶' : r.isBlocked ? '⧗' : '○'
-      const meta = [
-        r.isHuman ? 'you' : r.agent,
-        r.sessionId.slice(0, 6),
-        r.isBlocked ? 'blocked' : '',
-        r.blocks ? `unblocks ${r.blocks}` : '',
-        r.isLive ? '' : 'session ended',
-      ].filter(Boolean).join(' · ')
-      return [`${mark} P${r.priority} ${r.title} `, meta] as const
+    // Agent groups, OmniFocus-project style; your items first as their own group.
+    const groups = new Map<string, Row[]>()
+    for (const r of rows) {
+      const g = r.isHuman ? 'you' : `${r.sessionId}|${r.agent}`
+      groups.set(g, [...(groups.get(g) ?? []), r])
     }
+
+    const tab = (v: string) => {
+      const n = all.filter(r => inView(r, v)).length
+      const isOn = v === view
+      const { glyph, name, color } = TABS[v as keyof typeof TABS]
+      return (
+        <Button key={`view:${v}`} plain onPress={() => void update($, viewAtom, () => v)}>
+          <Text color={isOn ? '#1c1c1e' : color} backgroundColor={isOn ? color : undefined} bold={isOn}>{` ${glyph} ${name} ${n} `}</Text>
+        </Button>
+      )
+    }
+
+    const row = (r: Row) => {
+      const b = bullet(r)
+      const pc = PRIO[r.priority] ?? PRIO[2]!
+      const isSel = rowKey(r) === selected
+      const tail = `${r.priority <= 1 ? ' ⚑' : ''} P${r.priority}${r.blocks ? ` ⇢${r.blocks}` : ''}${r.isLive ? '' : ' ✝'}`
+      const title = cut(r.title, width - tail.length - 5)
+      return (
+        <Button key={`row:${rowKey(r)}`} plain onPress={() => void update($, selAtom, s => (s === rowKey(r) ? '' : rowKey(r)))}>
+          <Text color={b.color} bold>{` ${b.glyph} `}</Text>
+          <Text bold={isSel} inverse={isSel} strikethrough={false} dimColor={r.isBlocked && !isSel}>{title}</Text>
+          {r.priority <= 1 && <Text color={pc.color}>{' ⚑'}</Text>}
+          <Text color="#1c1c1e" backgroundColor={pc.color}>{` P${r.priority} `}</Text>
+          {r.blocks > 0 && <Text color="#64d2ff">{` ⇢${r.blocks}`}</Text>}
+          {!r.isLive && <Text dimColor>{' ✝'}</Text>}
+        </Button>
+      )
+    }
+
+    const header = (g: string, list: Row[]) => {
+      if (g === 'you') return <Text key="h:you" color={TABS.you.color} bold>{`◆ Waiting on you  ${list.length}`}</Text>
+      const r = list[0]!
+      const c = agentColor(`${r.sessionId}${r.agent}`)
+      const where = r.sessionId === me ? 'this session' : `session ${r.sessionId.slice(0, 6)}`
+      return (
+        <Text key={`h:${g}`}>
+          <Text color={c} bold>{`● ${r.agent === 'main' ? 'main agent' : `agent ${r.agent.slice(0, 8)}`}`}</Text>
+          <Text dimColor>{`  ${where}${r.isLive ? '' : ' · ended'} · ${list.length}`}</Text>
+        </Text>
+      )
+    }
+
+    const inspector = (r: Row) => {
+      const pc = PRIO[r.priority] ?? PRIO[2]!
+      const blockers = r.blockedBy.map(id => all.find(o => o.sessionId === r.sessionId && o.id === id)?.title).filter(Boolean)
+      const field = (k: string, v: string, color?: string) => (
+        <Text key={`f:${k}`}><Text dimColor>{k.padEnd(10)}</Text><Text color={color}>{v}</Text></Text>
+      )
+      return (
+        <Box key="inspector" flexDirection="column" borderStyle="round" borderColor={bullet(r).color} paddingX={1} marginTop={1}>
+          <Text bold color={bullet(r).color}>{`${bullet(r).glyph} ${r.title}`}</Text>
+          {r.note ? <Text dimColor wrap="wrap">{r.note}</Text> : null}
+          {field('Status', r.isBlocked ? 'blocked' : r.status.replace('_', ' '), bullet(r).color)}
+          {field('Priority', `P${r.priority} · ${pc.name}`, pc.color)}
+          {field('Owner', r.isHuman ? 'you' : r.agent, r.isHuman ? TABS.you.color : agentColor(`${r.sessionId}${r.agent}`))}
+          {field('Session', `${r.sessionId.slice(0, 8)}${r.sessionId === me ? ' (this one)' : ''}${r.isLive ? '' : ' · ended'}`)}
+          {blockers.length > 0 && field('Waits on', blockers.join(', '), '#8e8e93')}
+          {r.blocks > 0 && field('Unblocks', `${r.blocks} task${r.blocks > 1 ? 's' : ''}`, '#64d2ff')}
+          <Box flexDirection="row" gap={1} marginTop={1}>
+            {!r.isHuman && r.isLive && <Button key="act:kick" hotkey="k" variant="primary" label="▶ Kick off" onPress={() => void kickOff($, r)} />}
+            <Button key="act:done" hotkey="d" label="✓ Done" onPress={() => void tickDone($, r)} />
+            <Button key="act:close" hotkey="x" role="dismiss" label="Close" onPress={() => void update($, selAtom, () => '')} />
+          </Box>
+          <Box flexDirection="row" gap={1}>
+            <Text dimColor>{'Change to'.padEnd(10)}</Text>
+            {PRIO.map((p, n) => (
+              <Button key={`act:p${n}`} plain onPress={() => void setPrio($, r, n)}>
+                <Text color={n === r.priority ? '#1c1c1e' : p.color} backgroundColor={n === r.priority ? p.color : undefined} bold={n === r.priority}>{` P${n} `}</Text>
+              </Button>
+            ))}
+          </Box>
+        </Box>
+      )
+    }
+
+    const body: unknown[] = []
+    for (const [g, list] of groups) {
+      if (room <= 1) break
+      body.push(header(g, list))
+      room--
+      for (const r of list.slice(0, room)) body.push(row(r))
+      room -= Math.min(list.length, room)
+    }
+    const shown = body.length - groups.size
 
     return (
       <Box flexDirection="column">
+        <Box flexDirection="row" justifyContent="space-between">
+          <Text bold color={TABS.you.color}>☑ Agent Todos</Text>
+          <Text dimColor>{`${project} · ${all.length} open`}</Text>
+        </Box>
+        <Box flexDirection="row" flexWrap="wrap">{VIEWS.map(tab)}</Box>
         {Input && (
-          <Input
-            key="q"
-            label="Search"
-            placeholder="words, p0, you, blocked, agent…"
-            value={query}
-            submitLabel="filter"
-            onInput={v => void update($, queryAtom, () => v)}
-            onSubmit={v => void update($, queryAtom, () => v)}
-          />
+          <Input key="q" label="⌕" placeholder="search titles, notes, agents, p0…" value={query} submitLabel="filter"
+            onInput={v => void update($, queryAtom, () => v)} onSubmit={v => void update($, queryAtom, () => v)} />
         )}
-        <Text dimColor>
-          {project} · {all.length} open · {yours} on you{query ? ` · ${rows.length} match` : ''}
-        </Text>
-        {rows.length === 0 && <Text dimColor>{all.length ? 'Nothing matches.' : 'No open todos. Agents add them with TaskCreate / human_todo.'}</Text>}
-        {rows.slice(0, room).map(r => {
-          const [text, meta] = line(r)
-          return r.isHuman ? (
-            <Button key={`${r.sessionId}:${r.id}`} plain onPress={() => void tickDone($, r)}>
-              <Text color="yellow" bold>{text}</Text>
-              <Text dimColor>{meta} · press to tick off</Text>
-            </Button>
-          ) : (
-            <Text key={`${r.sessionId}:${r.id}`} dimColor={r.isBlocked}>
-              {text}
-              <Text dimColor>{meta}</Text>
-            </Text>
-          )
-        })}
-        {rows.length > room && <Text dimColor>+{rows.length - room} more — narrow the search</Text>}
+        {rows.length === 0 && (
+          <Text dimColor>{all.length ? '  Nothing in this perspective.' : '  All clear — agents add todos with TaskCreate / human_todo.'}</Text>
+        )}
+        {body as never}
+        {rows.length > shown && shown >= 0 && <Text dimColor>{`  +${rows.length - Math.max(0, shown)} more — search or switch perspective`}</Text>}
+        {sel && inspector(sel)}
       </Box>
     )
   })
 }
+
+const TABS = {
+  you: { glyph: '◆', name: 'You', color: '#bf5af2' },
+  urgent: { glyph: '⚑', name: 'Urgent', color: '#ff9f0a' },
+  active: { glyph: '◐', name: 'Active', color: '#30d158' },
+  blocked: { glyph: '⊘', name: 'Blocked', color: '#8e8e93' },
+  all: { glyph: '≡', name: 'All', color: '#0a84ff' },
+}
+
+const PRIO = [
+  { name: 'urgent', color: '#ff453a' },
+  { name: 'high', color: '#ff9f0a' },
+  { name: 'normal', color: '#0a84ff' },
+  { name: 'someday', color: '#8e8e93' },
+]
+
+/** Each kind of todo gets its own bullet: yours, running, blocked, then by priority. */
+function bullet(r: Row) {
+  if (r.isHuman) return { glyph: '◆', color: TABS.you.color }
+  if (r.status === 'in_progress') return { glyph: '◐', color: TABS.active.color }
+  if (r.isBlocked) return { glyph: '⊘', color: TABS.blocked.color }
+  const p = PRIO[r.priority] ?? PRIO[2]!
+  return { glyph: r.priority === 0 ? '◉' : r.priority === 3 ? '◌' : '○', color: p.color }
+}
+
+const AGENT_COLORS = ['#64d2ff', '#ffd60a', '#ff375f', '#66d4cf', '#5e5ce6', '#ac8e68', '#30d158']
+function agentColor(s: string) {
+  let h = 0
+  for (const ch of s) h = (h * 31 + ch.charCodeAt(0)) | 0
+  return AGENT_COLORS[Math.abs(h) % AGENT_COLORS.length]!
+}
+
+const cut = (s: string, n: number) => (s.length > n ? `${s.slice(0, Math.max(1, n - 1))}…` : s)

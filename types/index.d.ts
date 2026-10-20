@@ -28,6 +28,6 @@ export type Row = Item & {
 
 declare module 'claude-code' {
   interface PluginState {
-    'agent-todos': { rows: Row[]; query: string; root: string }
+    'agent-todos': { rows: Row[]; query: string; root: string; view: string; selected: string }
   }
 }

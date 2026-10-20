@@ -34,7 +34,23 @@ const open = (i: Item) => i.status !== 'completed'
  * blocked, priority, in-progress, how much each one unblocks.
  * Agent items die with their session; your items stay until you tick them.
  */
-export function rank(files: SessionFile[], root: string, live: Set<string>, done: Set<string>): Row[] {
+export const rowKey = (r: { sessionId: string; id: string }) => `${r.sessionId}:${r.id}`
+
+export const VIEWS = ['you', 'urgent', 'active', 'blocked', 'all'] as const
+export type View = (typeof VIEWS)[number]
+
+/** OmniFocus-style perspectives. */
+export function inView(r: Row, view: string) {
+  if (view === 'you') return r.isHuman
+  if (view === 'urgent') return r.priority <= 1
+  if (view === 'active') return r.status === 'in_progress'
+  if (view === 'blocked') return r.isBlocked
+  return true
+}
+
+export function rank(
+  files: SessionFile[], root: string, live: Set<string>, done: Set<string>, prio: Record<string, number> = {},
+): Row[] {
   const rows: Row[] = []
   for (const f of files) {
     if (!isRelevant(f.cwd, root)) continue
@@ -45,6 +61,7 @@ export function rank(files: SessionFile[], root: string, live: Set<string>, done
       if (!isLive && !i.isHuman) continue
       rows.push({
         ...i,
+        priority: prio[`${f.sessionId}:${i.id}`] ?? i.priority,
         sessionId: f.sessionId,
         cwd: f.cwd,
         isLive,

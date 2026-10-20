@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import type { Item, SessionFile } from '../types'
-import { matches, parseTitle, rank } from './board'
+import { inView, matches, parseTitle, rank } from './board'
 
 const item = (id: string, over: Partial<Item> = {}): Item =>
   ({ id, title: id, status: 'pending', priority: 2, isHuman: false, blockedBy: [], agent: 'main', ...over })
@@ -34,4 +34,12 @@ test('matches: all terms, case-insensitive, tags', () => {
   expect(matches(r, 'deploy p1 you')).toBe(true)
   expect(matches(r, 'deploy p0')).toBe(false)
   expect(matches(r, '')).toBe(true)
+})
+
+test('priority override re-sorts and perspectives filter', () => {
+  const files: SessionFile[] = [{ sessionId: 's', cwd: '/p', updatedAt: 0, items: [item('a', { priority: 0 }), item('b', { priority: 3 })] }]
+  const rows = rank(files, '/p', new Set(['s']), new Set(), { 's:b': 0, 's:a': 2 })
+  expect(rows.map(r => [r.id, r.priority])).toEqual([['b', 0], ['a', 2]])
+  expect(rows.filter(r => inView(r, 'urgent')).map(r => r.id)).toEqual(['b'])
+  expect(rows.filter(r => inView(r, 'you')).length).toBe(0)
 })

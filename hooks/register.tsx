@@ -85,6 +85,9 @@ async function setPrio($: $, row: Row, priority: number) {
 
 const SCAN_RE = '(TODO|FIXME|HACK|XXX)|^[[:space:]]*([-*+]|[0-9]+\\.)[[:space:]]+\\[ \\]'
 
+// Outside git there is no .gitignore to lean on: skip installed deps (a .venv alone holds ~27k numpy/sklearn TODOs) and build output.
+const SKIP_DIRS = ['.git', 'node_modules', '*venv*', 'site-packages', '__pycache__', '.tox', '.cache', '.next', 'vendor', 'Pods', 'dist', 'build', 'target']
+
 /** Find TODO/FIXME/HACK/XXX comments and open `- [ ]` checkboxes in the project; they replace the last scan. */
 async function scanRepo($: $) {
   const root = await $.session.root()
@@ -93,7 +96,7 @@ async function scanRepo($: $) {
     const git = await $.process.run(['git', 'grep', '-n', '-I', '-E', SCAN_RE, '--', '.', ':!*.lock', ':!*.min.*', ':!*.map'], { cwd: root, timeoutMs: 60_000 })
     const out = git.exitCode <= 1 && !git.stderr.includes('not a git repository')
       ? git.stdout
-      : (await $.process.run(['grep', '-rnI', '-E', SCAN_RE, '--exclude-dir=node_modules', '--exclude-dir=.git', '--exclude-dir=dist', '--exclude-dir=build', '.'], { cwd: root, timeoutMs: 60_000 })).stdout
+      : (await $.process.run(['grep', '-rnI', '-E', SCAN_RE, ...SKIP_DIRS.map(d => `--exclude-dir=${d}`), '.'], { cwd: root, timeoutMs: 60_000 })).stdout
     const name = (await $.process.run(['git', 'config', 'user.name'], { cwd: root }).catch(() => undefined))?.stdout.trim() ?? ''
     const home = ((await $.env.get('HOME')) ?? '').split('/').pop() ?? ''
     const found = parseScan(out, { me: [...name.split(/\s+/), home] })
